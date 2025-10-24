@@ -3,8 +3,8 @@ FROM node:20-alpine AS deps
 WORKDIR /app
 
 # Install dependencies based on the preferred package manager
-COPY apps/web/package.json apps/web/package-lock.json* ./
-RUN npm ci
+COPY apps/web/package.json ./
+RUN npm install --legacy-peer-deps
 
 # Rebuild the source code only when needed
 FROM node:20-alpine AS builder
@@ -24,10 +24,13 @@ ENV NODE_ENV production
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
-# Copy necessary files
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+# Copy built application
+COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nextjs:nodejs /app/package.json ./package.json
+
+# Create public directory if needed
+RUN mkdir -p ./public
 
 USER nextjs
 
@@ -36,4 +39,4 @@ EXPOSE 3000
 ENV PORT 3000
 ENV HOSTNAME "0.0.0.0"
 
-CMD ["node", "server.js"]
+CMD ["npm", "start"]
