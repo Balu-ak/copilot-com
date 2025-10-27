@@ -1,286 +1,184 @@
-"""
-LangGraph Orchestrator - Multi-Agent Workflow for AutoBrain
-"""
+# packages/orchestrator/graph.py
+from __future__ import annotations
+
 import os
-from typing import Dict, List, Any, AsyncGenerator
-from dataclasses import dataclass
-import json
+from typing import Any, Dict, List, Tuple
 
-try:
-    from langgraph.graph import StateGraph, END
-except ImportError:
-    # Fallback if langgraph not installed
-    StateGraph = None
-    END = None
+from langgraph.graph import StateGraph, END
 
-@dataclass
-class GraphState:
-    """State passed through the graph"""
-    org_id: str
-    conversation_id: str
-    query: str
-    route: str = ""
-    retrieved_docs: List[Dict] = None
-    answer: str = ""
-    sources: List[Dict] = None
-    metadata: Dict = None
-    tools: List[str] = None
-    
-    def __post_init__(self):
-        if self.retrieved_docs is None:
-            self.retrieved_docs = []
-        if self.sources is None:
-            self.sources = []
-        if self.metadata is None:
-            self.metadata = {}
-        if self.tools is None:
-            self.tools = []
+# Retrieval helper (our Pinecone adapter)
+# Path assumes you mounted ./apps and ./packages as in docker-compose
+from apps.api.vector_store.pinecone_store import query as pc_query
 
-# LLM Provider Interface
-class LLMProvider:
-    """Abstract LLM provider"""
-    
-    def __init__(self):
-        self.provider = os.getenv("LLM_PROVIDER", "openai")
-        
-    async def completion(self, system: str, user: str, **kwargs) -> str:
-        """Generate completion"""
-        if self.provider == "openai":
-            return await self._openai_completion(system, user, **kwargs)
-        elif self.provider == "anthropic":
-            return await self._anthropic_completion(system, user, **kwargs)
-        else:
-            return await self._openai_completion(system, user, **kwargs)
-    
-    async def _openai_completion(self, system: str, user: str, **kwargs) -> str:
-        """OpenAI completion"""
-        try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            
-            response = await client.chat.completions.create(
-                model=kwargs.get("model", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ],
-                temperature=kwargs.get("temperature", 0.7),
-                max_tokens=kwargs.get("max_tokens", 1000)
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error calling OpenAI: {str(e)}"
-    
-    async def _anthropic_completion(self, system: str, user: str, **kwargs) -> str:
-        """Anthropic completion"""
-        try:
-            from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-            
-            response = await client.messages.create(
-                model=kwargs.get("model", "claude-3-5-sonnet-20241022"),
-                max_tokens=kwargs.get("max_tokens", 1000),
-                system=system,
-                messages=[{"role": "user", "content": user}]
-            )
-            return response.content[0].text
-        except Exception as e:
-            return f"Error calling Anthropic: {str(e)}"
+# OpenAI SDK (>=1.40.0)
+from openai import OpenAI
 
-# Initialize LLM
-llm = LLMProvider()
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")  # -3-large (3072) or -3-small (1536)
+CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")        # final answer model
+MAX_CONTEXT_CHUNKS = int(os.getenv("MAX_CONTEXT_CHUNKS", "6"))
 
-# Agent Nodes
-async def router_node(state: GraphState) -> GraphState:
-    """Route the query to appropriate agent"""
-    system = """You are a routing agent. Classify the user's query into one of:
-- 'qa': Question answering from knowledge base
-- 'summarize': Summarization task
-- 'action': Action/task execution (send email, create task, etc.)
+_openai_client = OpenAI()
 
-Respond with just the category name."""
-    
-    route = await llm.completion(system, state.query, max_tokens=50)
-    route = route.strip().lower()
-    
-    if route not in ['qa', 'summarize', 'action']:
-        route = 'qa'  # default
-    
-    state.route = route
-    state.metadata['route'] = route
-    return state
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def embed_text(text: str) -> List[float]:
+    """
+    Returns a single embedding vector for `text` using OpenAI embeddings.
+    """
+    # OpenAI Embeddings API (responses differ by SDK version; this matches >=1.0.0)
+    resp = _openai_client.embeddings.create(model=EMBED_MODEL, input=text)
+    return resp.data[0].embedding
 
-async def retrieve_node(state: GraphState) -> GraphState:
-    """Retrieve relevant documents from vector DB"""
-    # In production, query Weaviate/Pinecone with org_id filter
-    # For demo, return mock documents
-    
-    mock_docs = [
-        {
-            "id": "doc1",
-            "content": "AutoBrain is a knowledge assistant that helps teams stay organized and informed.",
-            "source": "docs",
-            "score": 0.95
-        },
-        {
-            "id": "doc2",
-            "content": "The system uses RAG (Retrieval Augmented Generation) to provide accurate answers.",
-            "source": "docs",
-            "score": 0.87
-        }
-    ]
-    
-    state.retrieved_docs = mock_docs
-    state.sources = [{"id": d["id"], "source": d["source"], "score": d["score"]} for d in mock_docs]
-    return state
 
-async def synthesize_node(state: GraphState) -> GraphState:
-    """Synthesize answer from retrieved documents"""
-    context = "\n\n".join([f"Document {i+1}: {doc['content']}" 
-                           for i, doc in enumerate(state.retrieved_docs)])
-    
-    system = """You are a helpful AI assistant. Use the provided context to answer the user's question.
-If the context doesn't contain relevant information, say so clearly.
-Provide concise, accurate answers with citations to source documents."""
-    
-    user_prompt = f"""Context:
-{context}
+def build_context_from_matches(matches: List[Dict[str, Any]], limit: int = MAX_CONTEXT_CHUNKS) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Given Pinecone query matches, select top `limit` and build a context string
+    plus a sources array for the UI.
+    We expect each match.metadata to contain a 'text' field; adjust if your schema differs.
+    """
+    ctx_parts: List[str] = []
+    sources: List[Dict[str, Any]] = []
 
-Question: {state.query}
+    for m in matches[:limit]:
+        meta = m.get("metadata") or {}
+        text = meta.get("text") or ""
+        if not text:
+            continue
+        ctx_parts.append(text)
+        # Build a source object; customize fields to your metadata
+        sources.append({
+            "id": m.get("id"),
+            "score": m.get("score"),
+            "title": meta.get("title") or "",
+            "source": meta.get("source") or "",
+        })
 
-Provide a helpful answer based on the context above."""
-    
-    answer = await llm.completion(system, user_prompt, max_tokens=500)
-    state.answer = answer
-    return state
+    return "\n\n".join(ctx_parts), sources
 
-async def action_node(state: GraphState) -> GraphState:
-    """Execute actions (email, Slack, Jira, etc.)"""
-    system = """You are an action execution agent. Based on the user's request, 
-determine what action to take and provide a response."""
-    
-    # In production, actually execute actions via tools
-    # For demo, simulate action
-    
-    answer = await llm.completion(
-        system, 
-        f"User wants to: {state.query}\n\nSimulate the action and respond.",
-        max_tokens=300
+
+def call_llm_with_context(query: str, context: str) -> str:
+    """
+    Simple system+user prompt that uses context as retrieval result; returns model text.
+    """
+    system_prompt = (
+        "You are a careful AI assistant. Use the provided context when it is relevant. "
+        "If the context is not relevant, still answer concisely and accurately. "
+        "Always cite provided sources when applicable."
     )
-    
-    state.answer = answer
-    state.metadata['action_taken'] = "simulated"
-    return state
 
-# Build the graph
-def build_graph():
-    """Build the LangGraph workflow"""
-    if StateGraph is None:
-        return None
-    
-    graph = StateGraph(GraphState)
-    
-    # Add nodes
-    graph.add_node("router", router_node)
-    graph.add_node("retrieve", retrieve_node)
-    graph.add_node("synthesize", synthesize_node)
-    graph.add_node("action", action_node)
-    
-    # Set entry point
-    graph.set_entry_point("router")
-    
-    # Add conditional edges based on route
-    def route_condition(state: GraphState):
-        if state.route == "qa":
-            return "retrieve"
-        elif state.route == "summarize":
-            return "synthesize"
-        elif state.route == "action":
-            return "action"
-        return END
-    
-    graph.add_conditional_edges(
-        "router",
-        route_condition,
-        {
-            "retrieve": "retrieve",
-            "synthesize": "synthesize", 
-            "action": "action",
-            END: END
-        }
-    )
-    
-    # After retrieve, synthesize
-    graph.add_edge("retrieve", "synthesize")
-    
-    # End after synthesize or action
-    graph.add_edge("synthesize", END)
-    graph.add_edge("action", END)
-    
-    return graph.compile()
+    user_content = f"USER QUESTION:\n{query}\n\nCONTEXT:\n{context}\n"
 
-# Main execution functions
-async def run_graph(ctx: Dict, query: str) -> Dict:
-    """Run the orchestration graph"""
-    state = GraphState(
-        org_id=ctx["org_id"],
-        conversation_id=ctx["conversation_id"],
-        query=query,
-        tools=ctx.get("tools", [])
+    resp = _openai_client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ],
+        temperature=0.2,
     )
-    
-    # Simple fallback if LangGraph not available
-    graph = build_graph()
-    if graph is None:
-        # Fallback: simple pipeline
-        state = await router_node(state)
-        if state.route in ["qa", "summarize"]:
-            state = await retrieve_node(state)
-            state = await synthesize_node(state)
-        else:
-            state = await action_node(state)
-    else:
-        # Use LangGraph
-        result = await graph.ainvoke(state)
-        state = result
-    
+    return resp.choices[0].message.content or ""
+
+
+# -----------------------------------------------------------------------------
+# Graph state type (dict-based) and node functions
+# -----------------------------------------------------------------------------
+# LangGraph can work directly with dict state; no Pydantic required here.
+StateType = dict  # keys we use: org_id, conversation_id, query, route, retrieved_docs, answer, sources, metadata, tools
+
+def route_node(state: StateType) -> StateType:
+    """
+    Decide the route. This example always does retrieval; you can add heuristics.
+    Return a dict patch.
+    """
+    # Example heuristic (very simple): if query is short, still retrieve
+    route = "retrieve"
+    return {"route": route}
+
+
+def retrieve_node(state: StateType) -> StateType:
+    """
+    Embed the user query and fetch similar chunks from Pinecone.
+    Attach documents (as a list of dicts) into 'retrieved_docs' and accumulate 'sources'.
+    Return a dict patch.
+    """
+    org_id = state.get("org_id", "default")
+    query_text = state.get("query", "")
+
+    if not query_text:
+        return {"retrieved_docs": [], "sources": []}
+
+    # 1) embed query
+    qvec = embed_text(query_text)
+
+    # 2) query pinecone
+    res = pc_query(qvec, top_k=MAX_CONTEXT_CHUNKS, namespace=str(org_id)) or {}
+    matches = res.get("matches") or []
+
+    # 3) convert matches → context + sources
+    context, sources = build_context_from_matches(matches, limit=MAX_CONTEXT_CHUNKS)
+
+    # Save raw docs as well if needed
+    docs = []
+    for m in matches[:MAX_CONTEXT_CHUNKS]:
+        meta = (m.get("metadata") or {}).copy()
+        meta["__id"] = m.get("id")
+        meta["__score"] = m.get("score")
+        docs.append(meta)
+
+    # Stash both context (in metadata) and docs; `answer_node` will use metadata["context"]
+    metadata = state.get("metadata") or {}
+    metadata["context"] = context
+
     return {
-        "answer": state.answer,
-        "sources": state.sources,
-        "metadata": state.metadata
+        "retrieved_docs": docs,
+        "sources": sources,
+        "metadata": metadata,
     }
 
-async def run_graph_stream(ctx: Dict, query: str) -> AsyncGenerator[Dict, None]:
-    """Stream results from the graph"""
-    state = GraphState(
-        org_id=ctx["org_id"],
-        conversation_id=ctx["conversation_id"],
-        query=query,
-        tools=ctx.get("tools", [])
-    )
-    
-    # Yield routing decision
-    yield {"type": "routing", "content": "Analyzing your query..."}
-    state = await router_node(state)
-    yield {"type": "route", "content": f"Route: {state.route}"}
-    
-    # Retrieve if needed
-    if state.route in ["qa", "summarize"]:
-        yield {"type": "retrieving", "content": "Searching knowledge base..."}
-        state = await retrieve_node(state)
-        yield {"type": "sources", "content": state.sources}
-    
-    # Synthesize answer
-    yield {"type": "thinking", "content": "Generating answer..."}
-    if state.route in ["qa", "summarize"]:
-        state = await synthesize_node(state)
-    else:
-        state = await action_node(state)
-    
-    # Stream answer in chunks
-    words = state.answer.split()
-    for i in range(0, len(words), 5):
-        chunk = " ".join(words[i:i+5])
-        yield {"type": "answer", "content": chunk}
-    
-    yield {"type": "complete", "content": state.answer, "metadata": state.metadata}
+
+def answer_node(state: StateType) -> StateType:
+    """
+    Compose a final answer using the LLM and any context retrieved.
+    Return a dict patch with 'answer' (and optionally updated 'sources').
+    """
+    query_text = state.get("query", "")
+    context = (state.get("metadata") or {}).get("context", "") or ""
+
+    answer = call_llm_with_context(query_text, context)
+    # You can also enrich/normalize sources here if needed
+    sources = state.get("sources", []) or []
+    return {"answer": answer, "sources": sources}
+
+
+# -----------------------------------------------------------------------------
+# Build & export the compiled graph
+# -----------------------------------------------------------------------------
+def build_graph():
+    """
+    Build a simple 3-node graph:
+      entry -> route -> retrieve -> answer -> END
+    You can extend with tool nodes, re-routing, guardrails, etc.
+    """
+    g = StateGraph(StateType)
+
+    # register nodes
+    g.add_node("route", route_node)
+    g.add_node("retrieve", retrieve_node)
+    g.add_node("answer", answer_node)
+
+    # edges
+    g.set_entry_point("route")
+    g.add_edge("route", "retrieve")
+    g.add_edge("retrieve", "answer")
+    g.add_edge("answer", END)
+
+    # You can add a checkpointer here if desired.
+    return g.compile()
+
+
+# >>> Export a top-level 'graph' so `from packages.orchestrator.graph import graph` works
+graph = build_graph()

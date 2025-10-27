@@ -1,194 +1,136 @@
-"""
-AutoBrain API - FastAPI Backend
-"""
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional, List
-import asyncio
-import json
+# apps/api/main.py
+from __future__ import annotations
+
 import os
-from datetime import datetime
-import uuid
+import logging
+from uuid import uuid4
+from typing import List, Optional, Any, Dict
 
-app = FastAPI(title="AutoBrain API", version="1.0.0")
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-# CORS
+# IMPORTANT:
+# Your LangGraph graph MUST accept a dict state and return a dict state.
+# Every node should return partial dict updates (e.g., {"route": ...}, {"retrieved_docs": ...}).
+# Do NOT return a Pydantic/dataclass GraphState object from nodes.
+from packages.orchestrator.graph import graph
+
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
+APP_NAME = os.getenv("APP_NAME", "Autobrain API")
+APP_VERSION = os.getenv("APP_VERSION", "0.1.0")
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
+
+# CORS: allow your Next.js dev origin
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[frontend_origin],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("autobrain.api")
+
+# -----------------------------------------------------------------------------
 # Models
+# -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    org_id: str
+    org_id: str = Field(default="demo-org")
+    message: str = Field(min_length=1)
+    tools: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     conversation_id: Optional[str] = None
-    message: str
-    tools: List[str] = []
 
-class IngestRequest(BaseModel):
-    org_id: str
-    url: str
-    source: str = "web"
 
-class SummaryRequest(BaseModel):
-    org_id: str
-    query: str
-    days: int = 7
+class ChatResponse(BaseModel):
+    conversation_id: str
+    answer: str
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-# In-memory storage (replace with PostgreSQL in production)
-conversations = {}
-documents = {}
+
+# -----------------------------------------------------------------------------
+# Health & root
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
 
 @app.get("/")
-async def root():
-    return {
-        "service": "AutoBrain API",
-        "version": "1.0.0",
-        "status": "healthy"
-    }
+def root() -> Dict[str, str]:
+    return {"service": APP_NAME, "version": APP_VERSION}
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
-@app.post("/auth/verify")
-async def verify_auth(request: Request):
-    """Verify authentication token and upsert user/org"""
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    
-    token = auth_header.replace("Bearer ", "")
-    # In production, verify with Clerk/Auth.js
-    
-    return {
-        "user_id": str(uuid.uuid4()),
+# -----------------------------------------------------------------------------
+# Chat endpoint
+# -----------------------------------------------------------------------------
+@app.post("/chat/query", response_model=ChatResponse)
+def chat_query(payload: ChatRequest = Body(...)):
+    """
+    In:
+      {
         "org_id": "demo-org",
-        "email": "demo@autobrain.ai",
-        "role": "admin"
-    }
+        "message": "Hello test",
+        "tools": [],
+        "conversation_id": "optional-uuid"
+      }
 
-@app.post("/chat/query")
-async def chat_query(req: ChatRequest):
-    """Handle chat query with RAG and agent orchestration"""
-    from packages.orchestrator.graph import run_graph
-    
-    conv_id = req.conversation_id or str(uuid.uuid4())
-    
-    # Initialize conversation if new
-    if conv_id not in conversations:
-        conversations[conv_id] = {
-            "id": conv_id,
-            "org_id": req.org_id,
-            "messages": []
-        }
-    
-    # Add user message
-    conversations[conv_id]["messages"].append({
-        "role": "user",
-        "content": req.message,
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    
-    # Run orchestration graph
-    ctx = {
-        "org_id": req.org_id,
-        "conversation_id": conv_id,
-        "tools": req.tools
-    }
-    
-    result = await run_graph(ctx, req.message)
-    
-    # Add assistant response
-    conversations[conv_id]["messages"].append({
-        "role": "assistant",
-        "content": result["answer"],
-        "sources": result.get("sources", []),
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    
-    return {
-        "conversation_id": conv_id,
-        "answer": result["answer"],
-        "sources": result.get("sources", []),
-        "metadata": result.get("metadata", {})
-    }
+    Out:
+      {
+        "conversation_id": "...",
+        "answer": "...",
+        "sources": [...],
+        "metadata": {...}
+      }
+    """
+    try:
+        conv_id = payload.conversation_id or str(uuid4())
 
-@app.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
-    """Stream chat response with SSE"""
-    async def event_generator():
-        from packages.orchestrator.graph import run_graph_stream
-        
-        conv_id = req.conversation_id or str(uuid.uuid4())
-        ctx = {
-            "org_id": req.org_id,
+        # LangGraph requires dict state (NOT a Pydantic object)
+        initial_state: Dict[str, Any] = {
+            "org_id": payload.org_id,
             "conversation_id": conv_id,
-            "tools": req.tools
+            "query": payload.message,
+            "route": "",
+            "retrieved_docs": [],
+            "answer": "",
+            "sources": [],
+            "metadata": {},
+            "tools": payload.tools or [],
         }
-        
-        async for chunk in run_graph_stream(ctx, req.message):
-            yield f"data: {json.dumps(chunk)}\n\n"
-            await asyncio.sleep(0.01)
-        
-        yield f"data: {json.dumps({'done': True})}\n\n"
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream"
-    )
 
-@app.post("/ingest/url")
-async def ingest_url(req: IngestRequest):
-    """Ingest content from URL and index it"""
-    doc_id = str(uuid.uuid4())
-    
-    # In production, enqueue this to Celery/RQ worker
-    documents[doc_id] = {
-        "id": doc_id,
-        "org_id": req.org_id,
-        "source": req.source,
-        "uri": req.url,
-        "status": "queued",
-        "created_at": datetime.utcnow().isoformat()
-    }
-    
-    return {
-        "doc_id": doc_id,
-        "status": "queued",
-        "message": "Document queued for ingestion"
-    }
+        # Invoke the compiled graph; it must return a dict-like state
+        state: Dict[str, Any] = graph.invoke(initial_state)
 
-@app.get("/documents/{doc_id}")
-async def get_document(doc_id: str):
-    """Get document status"""
-    if doc_id not in documents:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return documents[doc_id]
+        return ChatResponse(
+            conversation_id=conv_id,
+            answer=state.get("answer", ""),
+            sources=state.get("sources", []) or [],
+            metadata=state.get("metadata", {}) or {},
+        )
 
-@app.get("/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str):
-    """Get conversation history"""
-    if conversation_id not in conversations:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return conversations[conversation_id]
+    except Exception as e:
+        # While debugging, surface the error; keep this or replace with generic message for prod
+        logger.exception("chat/query failed")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-@app.post("/actions/summarize-weekly")
-async def schedule_summary(req: SummaryRequest):
-    """Schedule weekly summary generation"""
-    job_id = str(uuid.uuid4())
-    
-    return {
-        "job_id": job_id,
-        "status": "scheduled",
-        "message": "Weekly summary job scheduled"
-    }
 
+# -----------------------------------------------------------------------------
+# Optional: local dev runner (usually Docker runs uvicorn directly)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "apps.api.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
+    )
+

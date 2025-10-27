@@ -1,3 +1,5 @@
+# docker-compose.yml
+
 services:
   # PostgreSQL Database
   postgres:
@@ -30,42 +32,35 @@ services:
       timeout: 5s
       retries: 5
 
-  # Weaviate Vector Database
-  weaviate:
-    image: semitechnologies/weaviate:1.23.7
-    container_name: autobrain-weaviate
-    environment:
-      QUERY_DEFAULTS_LIMIT: 25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
-      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-      DEFAULT_VECTORIZER_MODULE: 'none'
-      ENABLE_MODULES: ''
-      CLUSTER_HOSTNAME: 'node1'
-    volumes:
-      - weaviate_data:/var/lib/weaviate
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # FastAPI Backend
+  # FastAPI Backend (Pinecone, no Weaviate container)
   api:
     build:
       context: .
       dockerfile: infra/docker/Dockerfile.api
     container_name: autobrain-api
+    working_dir: /app                  # <-- ensure imports like `apps.api.main` resolve
     environment:
+      # DB/Cache
       DATABASE_URL: postgresql://autobrain:autobrain_dev_password@postgres:5432/autobrain
       REDIS_URL: redis://redis:6379/0
-      WEAVIATE_URL: http://weaviate:8080
+
+      # Pinecone (managed)
+      PINECONE_API_KEY: ${PINECONE_API_KEY:-}
+      PINECONE_ENVIRONMENT: ${PINECONE_ENVIRONMENT:-us-east-1}
+      PINECONE_INDEX: ${PINECONE_INDEX:-autobrain-dev}
+
+      # LLMs
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+
+      # App
       API_SECRET_KEY: dev_secret_key_change_in_production
+
+      # Embeddings model (must match your Pinecone index dimension)
+      # For text-embedding-3-large use 3072-dim in your code
+      EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-large}
     ports:
       - "8000:8000"
     depends_on:
@@ -73,12 +68,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      weaviate:
-        condition: service_healthy
     volumes:
       - ./apps/api:/app/apps/api
       - ./packages:/app/packages
-    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000   # <-- no --reload
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped           # <-- if it crashes, it restarts so you can see logs
 
   # Next.js Frontend
   web:
@@ -100,8 +99,8 @@ services:
 
 volumes:
   postgres_data:
-  weaviate_data:
 
 networks:
   default:
     name: autobrain-network
+
